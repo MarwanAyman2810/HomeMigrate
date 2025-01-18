@@ -13,8 +13,8 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
-
 	"fyne.io/fyne/v2/widget"
+
 	"github.com/shirou/gopsutil/disk"
 )
 
@@ -26,6 +26,11 @@ func init() {
 		return
 	}
 	log.SetOutput(logFile)
+}
+
+type USBEvent struct {
+	path    string
+	removed bool
 }
 
 func main() {
@@ -50,25 +55,78 @@ func main() {
 	progress := widget.NewProgressBar()
 	progress.Hide()
 
+	// Create a list to show available USB drives
+	usbList := widget.NewList(
+		func() int { return 0 }, // Length will be updated dynamically
+		func() fyne.CanvasObject { // Create template for list items
+			return widget.NewLabel("Template")
+		},
+		func(id widget.ListItemID, item fyne.CanvasObject) {}, // Binding will be updated dynamically
+	)
+	usbList.Hide()
+
 	// Create a channel to receive USB detection events
-	usbChan := make(chan string)
+	usbChan := make(chan USBEvent)
+	var availableUSBs []string
 
 	// Start USB detection in background
 	go detectUSB(usbChan)
 	fmt.Println("Started USB detection")
 
+	// Start a goroutine to handle USB events
+	go func() {
+		for event := range usbChan {
+			if event.removed {
+				// Remove the USB from available list
+				for i, path := range availableUSBs {
+					if path == event.path {
+						availableUSBs = append(availableUSBs[:i], availableUSBs[i+1:]...)
+						break
+					}
+				}
+			} else if event.path != "" {
+				// Add new USB to available list
+				availableUSBs = append(availableUSBs, event.path)
+			}
+
+			// Update the list widget
+			usbList.Length = func() int {
+				return len(availableUSBs)
+			}
+			usbList.UpdateItem = func(id widget.ListItemID, item fyne.CanvasObject) {
+				label := item.(*widget.Label)
+				label.SetText(fmt.Sprintf("USB Drive at: %s", availableUSBs[id]))
+			}
+			usbList.Refresh()
+
+			// Update visibility and status
+			if len(availableUSBs) > 0 {
+				status.SetText("Please select a USB drive for migration")
+				usbList.Show()
+			} else {
+				status.SetText("Waiting for USB drive...")
+				usbList.Hide()
+			}
+		}
+	}()
+
+	var selectedUSB string
+	usbList.OnSelected = func(id widget.ListItemID) {
+		selectedUSB = availableUSBs[id]
+		status.SetText(fmt.Sprintf("Selected USB drive at: %s\nClick Start Migration to begin", selectedUSB))
+	}
+
 	// Button to start migration
 	startBtn := widget.NewButton("Start Migration", func() {
 		fmt.Println("Start button clicked")
-		usbPath := <-usbChan
-		if usbPath == "" {
-			dialog.ShowError(fmt.Errorf("no USB drive detected"), window)
+		if selectedUSB == "" {
+			dialog.ShowError(fmt.Errorf("please select a USB drive first"), window)
 			return
 		}
 
 		progress.Show()
 		go func() {
-			err := copyHomeFolder(usbPath, progress)
+			err := copyHomeFolder(selectedUSB, progress)
 			if err != nil {
 				dialog.ShowError(err, window)
 				status.SetText("Migration failed: " + err.Error())
@@ -83,20 +141,21 @@ func main() {
 	// Layout
 	content := container.NewVBox(
 		status,
+		usbList,
 		progress,
 		startBtn,
 	)
 
 	window.SetContent(content)
-	window.Resize(fyne.NewSize(300, 200))
+	window.Resize(fyne.NewSize(400, 300))
 	fmt.Println("Set up window content")
 
 	fmt.Println("About to show window")
 	window.ShowAndRun()
-	fmt.Println("Window closed") // This will only print when the window is closed
+	fmt.Println("Window closed")
 }
 
-func detectUSB(usbChan chan string) {
+func detectUSB(usbChan chan USBEvent) {
 	var previousPartitions []string
 
 	for {
@@ -125,7 +184,23 @@ func detectUSB(usbChan chan string) {
 			if !found {
 				// New USB drive detected
 				log.Println("New USB drive detected:", current)
-				usbChan <- current
+				usbChan <- USBEvent{path: current, removed: false}
+			}
+		}
+
+		// Check for removed USB drives
+		for _, previous := range previousPartitions {
+			found := false
+			for _, current := range currentPartitions {
+				if current == previous {
+					found = true
+					break
+				}
+			}
+			if !found {
+				// USB drive removed
+				log.Println("USB drive removed:", previous)
+				usbChan <- USBEvent{path: previous, removed: true}
 			}
 		}
 
