@@ -55,15 +55,14 @@ func main() {
 	progress := widget.NewProgressBar()
 	progress.Hide()
 
-	// Create a list to show available USB drives
-	usbList := widget.NewList(
-		func() int { return 0 }, // Length will be updated dynamically
-		func() fyne.CanvasObject { // Create template for list items
-			return widget.NewLabel("Template")
-		},
-		func(id widget.ListItemID, item fyne.CanvasObject) {}, // Binding will be updated dynamically
-	)
-	usbList.Hide()
+	// Create a dropdown to show available USB drives
+	usbSelect := widget.NewSelect([]string{}, func(selected string) {
+		if selected != "" {
+			status.SetText(fmt.Sprintf("Selected USB drive at: %s\nClick Start Migration to begin", selected))
+		}
+	})
+	usbSelect.PlaceHolder = "Select USB Drive"
+	usbSelect.Hide()
 
 	// Create a channel to receive USB detection events
 	usbChan := make(chan USBEvent)
@@ -89,44 +88,39 @@ func main() {
 				availableUSBs = append(availableUSBs, event.path)
 			}
 
-			// Update the list widget
-			usbList.Length = func() int {
-				return len(availableUSBs)
+			// Update the dropdown options
+			usbSelect.Options = availableUSBs
+			
+			// If the currently selected USB was removed, clear the selection
+			if event.removed && event.path == usbSelect.Selected {
+				usbSelect.Selected = ""
+				usbSelect.Refresh()
 			}
-			usbList.UpdateItem = func(id widget.ListItemID, item fyne.CanvasObject) {
-				label := item.(*widget.Label)
-				label.SetText(fmt.Sprintf("USB Drive at: %s", availableUSBs[id]))
-			}
-			usbList.Refresh()
 
 			// Update visibility and status
 			if len(availableUSBs) > 0 {
 				status.SetText("Please select a USB drive for migration")
-				usbList.Show()
+				usbSelect.Show()
 			} else {
 				status.SetText("Waiting for USB drive...")
-				usbList.Hide()
+				usbSelect.Hide()
+				usbSelect.Selected = ""
 			}
+			usbSelect.Refresh()
 		}
 	}()
-
-	var selectedUSB string
-	usbList.OnSelected = func(id widget.ListItemID) {
-		selectedUSB = availableUSBs[id]
-		status.SetText(fmt.Sprintf("Selected USB drive at: %s\nClick Start Migration to begin", selectedUSB))
-	}
 
 	// Button to start migration
 	startBtn := widget.NewButton("Start Migration", func() {
 		fmt.Println("Start button clicked")
-		if selectedUSB == "" {
+		if usbSelect.Selected == "" {
 			dialog.ShowError(fmt.Errorf("please select a USB drive first"), window)
 			return
 		}
 
 		progress.Show()
 		go func() {
-			err := copyHomeFolder(selectedUSB, progress)
+			err := copyHomeFolder(usbSelect.Selected, progress)
 			if err != nil {
 				dialog.ShowError(err, window)
 				status.SetText("Migration failed: " + err.Error())
@@ -141,7 +135,7 @@ func main() {
 	// Layout
 	content := container.NewVBox(
 		status,
-		usbList,
+		usbSelect,
 		progress,
 		startBtn,
 	)
