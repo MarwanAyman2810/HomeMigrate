@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
-	"unicode"
-	"unicode/utf8"
+
+	// "unicode"
+	// "unicode/utf8"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -28,7 +30,26 @@ func init() {
 		fmt.Fprintf(os.Stderr, "Error opening log file: %v\n", err)
 		return
 	}
-	log.SetOutput(logFile)
+	log.SetOutput(io.MultiWriter(logFile, os.Stdout))
+}
+
+// Custom logger that also updates the UI
+type uiLogger struct {
+	textArea *widget.Entry
+	mu       sync.Mutex
+}
+
+func (l *uiLogger) Write(p []byte) (n int, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Update the text area
+	if l.textArea != nil {
+		l.textArea.SetText(l.textArea.Text + string(p))
+		l.textArea.Refresh()
+	}
+
+	return len(p), nil
 }
 
 type USBEvent struct {
@@ -57,12 +78,23 @@ func main() {
 	fmt.Println("Created new Fyne app")
 
 	window := myApp.NewWindow("Home Folder Migration")
+	window.Resize(fyne.NewSize(600, 400)) // Set a fixed size of 600x400
+	window.SetFixedSize(true)             // Prevent window resizing
 	fmt.Println("Created new window")
 
 	// Status label to show current operation
 	status := widget.NewLabel("Waiting for USB drive...")
 	progress := widget.NewProgressBar()
 	progress.Hide()
+
+	// Create log text area
+	logArea := widget.NewMultiLineEntry()
+	logArea.Disable() // Make it read-only
+	logArea.Resize(fyne.NewSize(580, 150))
+
+	// Set up custom logger
+	uiLog := &uiLogger{textArea: logArea}
+	log.SetOutput(io.MultiWriter(uiLog, os.Stdout))
 
 	// Create a channel to receive USB detection events
 	usbChan := make(chan USBEvent)
@@ -182,16 +214,17 @@ func main() {
 		}()
 	})
 
-	// Layout
+	// Create main container with padding
 	content := container.NewVBox(
 		status,
 		usbSelect,
-		progress,
 		startBtn,
+		progress,
+		widget.NewLabel("Logs:"),
+		logArea,
 	)
 
 	window.SetContent(content)
-	window.Resize(fyne.NewSize(400, 300))
 	fmt.Println("Set up window content")
 
 	fmt.Println("About to show window")
@@ -260,6 +293,14 @@ func copyHomeFolder(destPath string, progress *widget.ProgressBar) error {
 		return fmt.Errorf("error getting home directory: %v", err)
 	}
 
+	// Create the destination folder with absolute path
+	destHomeDir := filepath.Join(destPath, "home_backup")
+	absDestHomeDir, err := filepath.Abs(destHomeDir)
+	if err != nil {
+		log.Println("Error getting absolute path:", err)
+		return fmt.Errorf("error getting absolute path: %v", err)
+	}
+
 	// Count total files for progress bar
 	var totalFiles int64
 	filepath.Walk(homeDir, func(path string, info os.FileInfo, err error) error {
@@ -267,6 +308,34 @@ func copyHomeFolder(destPath string, progress *widget.ProgressBar) error {
 			log.Println("Error walking home directory:", err)
 			return nil
 		}
+		
+		// Skip hidden files and directories
+		if strings.HasPrefix(filepath.Base(path), ".") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		
+		// Skip system and cache directories
+		if strings.Contains(path, "go/pkg/mod") || 
+		   strings.Contains(path, ".cache") || 
+		   strings.Contains(path, ".local/share") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		
+		// Skip the backup directory
+		absPath, _ := filepath.Abs(path)
+		if strings.HasPrefix(absPath, absDestHomeDir) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		
 		if !info.IsDir() {
 			totalFiles++
 		}
@@ -277,7 +346,6 @@ func copyHomeFolder(destPath string, progress *widget.ProgressBar) error {
 	progress.SetValue(0)
 
 	// Create the destination folder
-	destHomeDir := filepath.Join(destPath, "home_backup")
 	err = os.MkdirAll(destHomeDir, 0755)
 	if err != nil {
 		log.Println("Error creating destination directory:", err)
@@ -291,6 +359,33 @@ func copyHomeFolder(destPath string, progress *widget.ProgressBar) error {
 			return err
 		}
 
+		// Skip hidden files and directories
+		if strings.HasPrefix(filepath.Base(srcPath), ".") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Skip system and cache directories
+		if strings.Contains(srcPath, "go/pkg/mod") || 
+		   strings.Contains(srcPath, ".cache") || 
+		   strings.Contains(srcPath, ".local/share") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Skip the backup directory using absolute path comparison
+		absSrcPath, _ := filepath.Abs(srcPath)
+		if strings.HasPrefix(absSrcPath, absDestHomeDir) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
 		// Calculate relative path
 		relPath, err := filepath.Rel(homeDir, srcPath)
 		if err != nil {
@@ -301,7 +396,12 @@ func copyHomeFolder(destPath string, progress *widget.ProgressBar) error {
 		destFilePath := filepath.Join(destHomeDir, relPath)
 
 		if info.IsDir() {
-			return os.MkdirAll(destFilePath, info.Mode())
+			err := os.MkdirAll(destFilePath, info.Mode())
+			if err != nil {
+				log.Printf("Error creating directory %s: %v", destFilePath, err)
+				return err
+			}
+			return nil // Skip further processing for directories
 		}
 
 		// Copy the file
