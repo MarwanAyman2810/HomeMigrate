@@ -194,11 +194,16 @@ func main() {
 		// Find the full path for the selected name
 		var selectedPath string
 		for _, usb := range availableUSBs {
-			if usb.name == strings.Split(usbSelect.Selected, " ")[0] {
+			// Fix the comparison to handle the size suffix in the selection
+			selectedDisplay := fmt.Sprintf("%s (%.1f GB)", usb.name, float64(usb.size)/(1024*1024*1024))
+			if usbSelect.Selected == selectedDisplay {
 				selectedPath = usb.path
 				break
 			}
 		}
+
+		// Add debug logging
+		log.Printf("Selected USB path: %s", selectedPath)
 
 		progress.Show()
 		go func() {
@@ -293,13 +298,14 @@ func copyHomeFolder(destPath string, progress *widget.ProgressBar) error {
 		return fmt.Errorf("error getting home directory: %v", err)
 	}
 
-	// Create the destination folder with absolute path
+	// Create the backup directory on the USB drive
 	destHomeDir := filepath.Join(destPath, "home_backup")
-	absDestHomeDir, err := filepath.Abs(destHomeDir)
-	if err != nil {
-		log.Println("Error getting absolute path:", err)
-		return fmt.Errorf("error getting absolute path: %v", err)
+	if err := os.MkdirAll(destHomeDir, 0755); err != nil {
+		log.Println("Error creating destination directory:", err)
+		return fmt.Errorf("error creating destination directory: %v", err)
 	}
+
+	log.Printf("Backing up to USB drive at: %s\n", destHomeDir)
 
 	// Count total files for progress bar
 	var totalFiles int64
@@ -308,34 +314,27 @@ func copyHomeFolder(destPath string, progress *widget.ProgressBar) error {
 			log.Println("Error walking home directory:", err)
 			return nil
 		}
-		
-		// Skip hidden files and directories
-		if strings.HasPrefix(filepath.Base(path), ".") {
-			if info.IsDir() {
-				return filepath.SkipDir
+
+		// Skip any path component that starts with a dot
+		pathComponents := strings.Split(path[len(homeDir):], string(os.PathSeparator))
+		for _, component := range pathComponents {
+			if strings.HasPrefix(component, ".") {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
-			return nil
 		}
-		
-		// Skip system and cache directories
-		if strings.Contains(path, "go/pkg/mod") || 
-		   strings.Contains(path, ".cache") || 
-		   strings.Contains(path, ".local/share") {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		
+
 		// Skip the backup directory
 		absPath, _ := filepath.Abs(path)
-		if strings.HasPrefix(absPath, absDestHomeDir) {
+		if strings.HasPrefix(absPath, destHomeDir) {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		
+
 		if !info.IsDir() {
 			totalFiles++
 		}
@@ -345,13 +344,6 @@ func copyHomeFolder(destPath string, progress *widget.ProgressBar) error {
 	var copiedFiles int64
 	progress.SetValue(0)
 
-	// Create the destination folder
-	err = os.MkdirAll(destHomeDir, 0755)
-	if err != nil {
-		log.Println("Error creating destination directory:", err)
-		return fmt.Errorf("error creating destination directory: %v", err)
-	}
-
 	// Copy files
 	err = filepath.Walk(homeDir, func(srcPath string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -359,27 +351,20 @@ func copyHomeFolder(destPath string, progress *widget.ProgressBar) error {
 			return err
 		}
 
-		// Skip hidden files and directories
-		if strings.HasPrefix(filepath.Base(srcPath), ".") {
-			if info.IsDir() {
-				return filepath.SkipDir
+		// Skip any path component that starts with a dot
+		pathComponents := strings.Split(srcPath[len(homeDir):], string(os.PathSeparator))
+		for _, component := range pathComponents {
+			if strings.HasPrefix(component, ".") {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
-			return nil
-		}
-
-		// Skip system and cache directories
-		if strings.Contains(srcPath, "go/pkg/mod") || 
-		   strings.Contains(srcPath, ".cache") || 
-		   strings.Contains(srcPath, ".local/share") {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
 		}
 
 		// Skip the backup directory using absolute path comparison
 		absSrcPath, _ := filepath.Abs(srcPath)
-		if strings.HasPrefix(absSrcPath, absDestHomeDir) {
+		if strings.HasPrefix(absSrcPath, destHomeDir) {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
