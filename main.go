@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -16,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/shirou/gopsutil/disk"
+	"golang.org/x/sys/unix"
 )
 
 func init() {
@@ -31,6 +34,12 @@ func init() {
 type USBEvent struct {
 	path    string
 	removed bool
+}
+
+type USBDrive struct {
+	name string
+	path string
+	size int64 // size in bytes
 }
 
 func main() {
@@ -55,18 +64,18 @@ func main() {
 	progress := widget.NewProgressBar()
 	progress.Hide()
 
+	// Create a channel to receive USB detection events
+	usbChan := make(chan USBEvent)
+	var availableUSBs []USBDrive
+
 	// Create a dropdown to show available USB drives
 	usbSelect := widget.NewSelect([]string{}, func(selected string) {
 		if selected != "" {
-			status.SetText(fmt.Sprintf("Selected USB drive at: %s\nClick Start Migration to begin", selected))
+			status.SetText(fmt.Sprintf("Selected USB drive: %s\nClick Start Migration to begin", selected))
 		}
 	})
 	usbSelect.PlaceHolder = "Select USB Drive"
 	usbSelect.Hide()
-
-	// Create a channel to receive USB detection events
-	usbChan := make(chan USBEvent)
-	var availableUSBs []string
 
 	// Start USB detection in background
 	go detectUSB(usbChan)
@@ -77,24 +86,56 @@ func main() {
 		for event := range usbChan {
 			if event.removed {
 				// Remove the USB from available list
-				for i, path := range availableUSBs {
-					if path == event.path {
+				for i, usb := range availableUSBs {
+					if usb.path == event.path {
 						availableUSBs = append(availableUSBs[:i], availableUSBs[i+1:]...)
 						break
 					}
 				}
 			} else if event.path != "" {
 				// Add new USB to available list
-				availableUSBs = append(availableUSBs, event.path)
+				name := filepath.Base(event.path)
+				// Get drive size
+				var stat unix.Statfs_t
+				if err := unix.Statfs(event.path, &stat); err == nil {
+					totalSize := int64(stat.Blocks) * int64(stat.Bsize)
+					availableUSBs = append(availableUSBs, USBDrive{
+						name: name,
+						path: event.path,
+						size: totalSize,
+					})
+				} else {
+					log.Printf("Error getting size for %s: %v", event.path, err)
+					availableUSBs = append(availableUSBs, USBDrive{
+						name: name,
+						path: event.path,
+						size: 0,
+					})
+				}
 			}
 
 			// Update the dropdown options
-			usbSelect.Options = availableUSBs
-			
+			var names []string
+			for _, usb := range availableUSBs {
+				sizeGB := float64(usb.size) / (1024 * 1024 * 1024)
+				names = append(names, fmt.Sprintf("%s (%.1f GB)", usb.name, sizeGB))
+			}
+			usbSelect.Options = names
+
 			// If the currently selected USB was removed, clear the selection
-			if event.removed && event.path == usbSelect.Selected {
-				usbSelect.Selected = ""
-				usbSelect.Refresh()
+			if event.removed {
+				selectedName := usbSelect.Selected
+				found := false
+				for _, usb := range availableUSBs {
+					if usb.name == selectedName {
+						found = true
+						break
+					}
+				}
+				if !found {
+					usbSelect.Selected = ""
+					usbSelect.Refresh()
+				}
 			}
 
 			// Update visibility and status
@@ -118,9 +159,18 @@ func main() {
 			return
 		}
 
+		// Find the full path for the selected name
+		var selectedPath string
+		for _, usb := range availableUSBs {
+			if usb.name == strings.Split(usbSelect.Selected, " ")[0] {
+				selectedPath = usb.path
+				break
+			}
+		}
+
 		progress.Show()
 		go func() {
-			err := copyHomeFolder(usbSelect.Selected, progress)
+			err := copyHomeFolder(selectedPath, progress)
 			if err != nil {
 				dialog.ShowError(err, window)
 				status.SetText("Migration failed: " + err.Error())
